@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 import scipy.sparse as sp
 from scipy.io import mmwrite
 
@@ -165,3 +166,65 @@ def test_import_anndata_generic_calls_mmread_with_spmatrix_true(tmp_path, monkey
 
     assert called["source"] == str(tmp_path / mtx_name)
     assert called["kwargs"] == {"spmatrix": True}
+
+
+def _import(tmp_path, matrix, **kwargs):
+    """Write a genes x cells matrix and import it with extra kwargs."""
+    n_genes, n_cells = matrix.shape
+    mtx_name, gene_name, sample_name = _write_generic_inputs(
+        tmp_path,
+        matrix,
+        gene_rows=[[f"g{i}"] for i in range(n_genes)],
+        sample_rows=[[f"c{i}"] for i in range(n_cells)],
+    )
+    return prep.import_anndata_generic(
+        str(tmp_path),
+        mtx_file=mtx_name,
+        gene_annotations=gene_name,
+        sample_annotations=sample_name,
+        sep="\t",
+        prefilter=False,
+        **kwargs,
+    )
+
+
+def test_import_anndata_generic_default_dtypes_unchanged(tmp_path):
+    """Without dtype kwargs the MatrixMarket integer field stays int64."""
+    adata = _import(tmp_path, np.array([[1, 0], [2, 3]], dtype=np.int64))
+    assert adata.X.dtype == np.int64
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.float32])
+def test_import_anndata_generic_data_dtype(tmp_path, dtype):
+    matrix = np.array([[1, 0], [2, 3], [0, 4]], dtype=np.int64)
+    adata = _import(tmp_path, matrix, data_dtype=dtype)
+    assert adata.X.dtype == dtype
+    np.testing.assert_array_equal(_to_dense(adata.X), matrix.T)
+
+
+def test_import_anndata_generic_index_dtype(tmp_path):
+    matrix = np.array([[1, 0], [2, 3], [0, 4]], dtype=np.int64)
+    adata = _import(tmp_path, matrix, index_dtype=np.int32, data_dtype=np.int32)
+    assert sp.isspmatrix_csr(adata.X)
+    assert adata.X.indices.dtype == np.int32
+    assert adata.X.indptr.dtype == np.int32
+    np.testing.assert_array_equal(_to_dense(adata.X), matrix.T)
+
+
+def test_import_anndata_generic_int_data_dtype_rejects_real_field(tmp_path):
+    matrix = np.array([[1.5, 0.0], [0.0, 2.0]], dtype=np.float64)
+    with pytest.raises(ValueError, match="requires an integer MatrixMarket field"):
+        _import(tmp_path, matrix, data_dtype=np.int32)
+
+
+def test_import_anndata_generic_int_data_dtype_rejects_overflow(tmp_path):
+    matrix = np.array([[2**40, 0], [0, 1]], dtype=np.int64)
+    with pytest.raises(ValueError, match="do not fit"):
+        _import(tmp_path, matrix, data_dtype=np.int32)
+
+
+def test_import_anndata_generic_index_dtype_rejects_overflow(tmp_path):
+    """200 cells cannot be addressed by int8 (max 127) indices."""
+    matrix = np.eye(200, dtype=np.int64)
+    with pytest.raises(ValueError, match="cannot address"):
+        _import(tmp_path, matrix, index_dtype=np.int8)

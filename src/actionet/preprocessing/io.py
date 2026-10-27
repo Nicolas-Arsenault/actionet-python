@@ -24,6 +24,40 @@ from ..io.rewrite import RewriteTransaction
 from .filter import filter_anndata
 
 
+def _cast_values(values: np.ndarray, dtype) -> np.ndarray:
+    """Cast matrix values to ``dtype``, refusing any lossy integer cast."""
+    dtype = np.dtype(dtype)
+    if values.dtype == dtype:
+        return values
+    if np.issubdtype(dtype, np.integer):
+        if not np.issubdtype(values.dtype, np.integer):
+            raise ValueError(
+                f"data_dtype={dtype} requires an integer MatrixMarket field, "
+                f"got {values.dtype} values"
+            )
+        info = np.iinfo(dtype)
+        if values.size and (values.min() < info.min or values.max() > info.max):
+            raise ValueError(f"Matrix values do not fit data_dtype={dtype}")
+    elif not np.issubdtype(dtype, np.floating):
+        raise ValueError(f"data_dtype must be an integer or float dtype, got {dtype}")
+    return values.astype(dtype, copy=False)
+
+
+def _cast_sparse_indices(X, dtype):
+    """Cast a CSR/CSC matrix's ``indices``/``indptr`` to an integer ``dtype``."""
+    dtype = np.dtype(dtype)
+    if not np.issubdtype(dtype, np.integer):
+        raise ValueError(f"index_dtype must be an integer dtype, got {dtype}")
+    limit = np.iinfo(dtype).max
+    if X.nnz > limit or max(X.shape) > limit:
+        raise ValueError(
+            f"index_dtype={dtype} cannot address nnz={X.nnz} / shape={X.shape}"
+        )
+    X.indices = X.indices.astype(dtype, copy=False)
+    X.indptr = X.indptr.astype(dtype, copy=False)
+    return X
+
+
 def import_anndata_generic(
     input_path: str,
     mtx_file: str,
@@ -34,8 +68,33 @@ def import_anndata_generic(
     sep: str = "\t",
     prefilter: bool = False,
     prefil_params: dict | None = None,
+    index_dtype: np.dtype | type | str | None = None,
+    data_dtype: np.dtype | type | str | None = None,
 ) -> AnnData:
-    """Python implementation of import.se.generic from R, using AnnData."""
+    """Python implementation of import.se.generic from R, using AnnData.
+
+    Parameters
+    ----------
+    index_dtype
+        Optional integer dtype for the sparse ``indices``/``indptr`` of ``X``
+        (e.g. ``np.int32``). ``None`` keeps SciPy's choice. Raises
+        ``ValueError`` if ``nnz`` or a matrix dimension does not fit.
+    data_dtype
+        Optional dtype for the stored values of ``X`` (e.g. ``np.int32`` or
+        ``np.float32``). ``None`` keeps the MatrixMarket field type
+        (``int64`` for ``integer``, ``float64`` for ``real``). An integer
+        ``data_dtype`` requires integer-valued input that fits the dtype,
+        otherwise ``ValueError`` is raised; no value is ever truncated.
+
+    Notes
+    -----
+    Values are cast right after ``mmread`` and before the CSC conversion, so
+    the CSC copy (the largest allocation) is built at the requested width.
+    ``mmread`` still materializes its own ``int64``/``float64`` values array
+    first. With SciPy >= 1.12, ``mmread`` and ``tocsc`` already use ``int32``
+    indices whenever they fit, so ``data_dtype`` is where most of the memory
+    saving comes from.
+    """
     gene_path = os.path.join(input_path, gene_annotations)
     gene_table = pd.read_csv(gene_path, sep=sep, header=None, dtype=str)
     if gene_headers is not None:
@@ -53,9 +112,16 @@ def import_anndata_generic(
     mtx_path = os.path.join(input_path, mtx_file)
     matrix = mmread(mtx_path, spmatrix=True)
     if sp.issparse(matrix):
+        if data_dtype is not None:
+            matrix.data = _cast_values(matrix.data, data_dtype)
         X = matrix.tocsc(copy=False).transpose(copy=False)
     else:
-        X = csr_matrix(np.asarray(matrix).T)
+        values = np.asarray(matrix)
+        if data_dtype is not None:
+            values = _cast_values(values, data_dtype)
+        X = csr_matrix(values.T)
+    if index_dtype is not None:
+        X = _cast_sparse_indices(X, index_dtype)
     adata = AnnData(X=X, obs=sample_annots, var=gene_table)
     adata.obs_names_make_unique(join="_")
     adata.var_names_make_unique(join="_")
